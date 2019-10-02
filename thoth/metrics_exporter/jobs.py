@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # thoth-metrics
-# Copyright(C) 2018, 2019 Christoph Görn
+# Copyright(C) 2018, 2019 Christoph Görn, Francesco Murdaca
 #
 # This program is free software: you can redistribute it and / or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,143 +15,297 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-"""This is a Promotheus exporter for Thoth."""
-
+"""This is a Prometheus exporter for Thoth."""
 
 import os
-import asyncio
-import aiohttp
 import logging
 
-from datetime import datetime
-from itertools import chain
-
-import requests
-
-from openshift.dynamic.exceptions import ResourceNotFoundError
-
 from thoth.storages import GraphDatabase
+from thoth.storages import SolverResultsStore
+from thoth.storages import AdvisersResultsStore
+from thoth.storages import AnalysisResultsStore
+from thoth.storages import InspectionResultsStore
+from thoth.storages import PackageAnalysisResultsStore
+from thoth.storages import ProvenanceResultsStore
+from thoth.storages import DependencyMonkeyReportsStore
 from thoth.common import init_logging
-from thoth.common.helpers import get_service_account_token
-from thoth.metrics_exporter import *
+from thoth.common import OpenShift
+import thoth.metrics_exporter.metrics as metrics
 
 
 init_logging()
 
-_LOGGER = logging.getLogger("thoth.metrics_exporter.jobs")
+_LOGGER = logging.getLogger(__name__)
+
+_MONITORED_STORES = (
+    AdvisersResultsStore(),
+    AnalysisResultsStore(),
+    InspectionResultsStore(),
+    ProvenanceResultsStore(),
+    PackageAnalysisResultsStore(),
+    SolverResultsStore(),
+    DependencyMonkeyReportsStore(),
+)
+
+_NAMESPACES_VARIABLES = [
+    "THOTH_FRONTEND_NAMESPACE",
+    "THOTH_MIDDLETIER_NAMESPACE",
+    "THOTH_BACKEND_NAMESPACE",
+    "THOTH_AMUN_NAMESPACE",
+    "THOTH_AMUN_INSPECTION_NAMESPACE",
+]
+
+_JOBS_LABELS = [
+    "component=dependency-monkey",
+    "component=amun-inspection-job",
+    "component=solver",
+    "component=package-extract",
+    "component=package-analyzer",
+    "component=provenance-checker",
+    "component=adviser",
+    "graph-sync-type=adviser",
+    "graph-sync-type=dependency-monkey",
+    "graph-sync-type=inspection",
+    "graph-sync-type=package-analyzer",
+    "graph-sync-type=package-extract",
+    "graph-sync-type=provenance-checker",
+    "graph-sync-type=solver",
+]
 
 
-@package_version_seconds.time()
-def get_retrieve_unsolved_pypi_packages():
-    """Get the total number of unsolved pypi packages in the graph database."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+_OPENSHIFT = OpenShift()
 
+
+def get_namespaces() -> set:
+    """Retrieve namespaces that shall be monitored by metrics-exporter."""
+    namespaces = []
+    for environment_varibale in _NAMESPACES_VARIABLES:
+        if os.getenv(environment_varibale):
+            namespaces.append(os.getenv(environment_varibale))
+        else:
+            _LOGGER.warning("Namespace variable not provided for %r", environment_varibale)
+    return set(namespaces)
+
+
+def get_thoth_jobs_per_label():
+    """Get the total number of Jobs per label with corresponding status."""
+    namespaces = get_namespaces()
+
+    for label_selector in _JOBS_LABELS:
+        for namespace in namespaces:
+            _LOGGER.info("Evaluating jobs metrics for Thoth namespace: %r", namespace)
+            jobs_status_evaluated = _OPENSHIFT.get_job_status_count(label_selector=label_selector, namespace=namespace)
+
+            for j_status, j_counts in jobs_status_evaluated.items():
+                metrics.jobs_status.labels(label_selector, j_status, namespace).set(j_counts)
+
+            _LOGGER.debug("thoth_jobs=%r", jobs_status_evaluated)
+
+
+def count_configmaps(config_map_list_items: list) -> int:
+    """Count the number of ConfigMaps for a certain label in a specific namespace."""
+    return len(config_map_list_items["items"])
+
+
+def get_configmaps_per_namespace_per_label():
+    """Get the total number of configmaps in the namespace based on labels."""
+    namespaces = get_namespaces()
+
+    _OPENSHIFT = OpenShift()
+    for namespace in namespaces:
+        _LOGGER.info("Evaluating configmaps metrics for Thoth namespace: %r", namespace)
+
+        for label in _JOBS_LABELS + ["operator=graph-sync", "operator=workload"]:
+            config_maps_items = _OPENSHIFT.get_configmaps(namespace=namespace, label_selector=label)
+            number_configmaps = count_configmaps(config_maps_items)
+            metrics.config_maps_number.labels(namespace, label).set(number_configmaps)
+            _LOGGER.debug(
+                "thoth_config_maps_number=%r, in namespace=%r for label=%r", number_configmaps, namespace, label
+            )
+
+
+def get_ceph_results_per_type():
+    """Get the total number of results in Ceph per type."""
+    for store in _MONITORED_STORES:
+        if not store.is_connected():
+            store.connect()
+        all_document_ids = store.get_document_listing()
+        list_ids = [str(cid) for cid in all_document_ids]
+        metrics.ceph_results_number.labels(store.RESULT_TYPE).set(len(list_ids))
+        _LOGGER.debug(f"ceph_results_number for {store.RESULT_TYPE} ={len(list_ids)}")
+
+
+def get_inspection_results_per_identifier():
+    """Get the total number of inspections in Ceph per identifier."""
+    store = InspectionResultsStore()
+    if not store.is_connected():
+        store.connect()
+
+    specific_list_ids = {}
+    specific_list_ids["without_identifier"] = 0
+    for ids in store.get_document_listing():
+        inspection_filter = "_".join(ids.split("-")[1:(len(ids.split("-")) - 1)])
+        if inspection_filter:
+            if inspection_filter not in specific_list_ids.keys():
+                specific_list_ids[inspection_filter] = 1
+            else:
+                specific_list_ids[inspection_filter] += 1
+        else:
+            specific_list_ids["without_identifier"] += 1
+
+    for identifier, identifier_list in specific_list_ids.items():
+        metrics.inspection_results_ceph.labels(identifier).set(identifier_list)
+        _LOGGER.debug(f"inspection_results_ceph for {identifier} ={identifier_list}")
+
+
+def get_python_packages_solver_error_count():
+    """Get the total number of python packages with solver error True and how many are unparsable or unsolvable."""
+    graph_db = GraphDatabase()
+    graph_db.connect()
+
+    total_python_packages_with_solver_error_unparsable = graph_db.get_error_python_packages_count(unparseable=True)
+    total_python_packages_with_solver_error_unsolvable = graph_db.get_error_python_packages_count(unsolvable=True)
+
+    metrics.graphdb_total_python_packages_with_solver_error_unparsable.set(
+        total_python_packages_with_solver_error_unparsable
+    )
+    metrics.graphdb_total_python_packages_with_solver_error_unsolvable.set(
+        total_python_packages_with_solver_error_unsolvable
+    )
+    metrics.graphdb_total_python_packages_with_solver_error.set(
+        total_python_packages_with_solver_error_unparsable + total_python_packages_with_solver_error_unsolvable
+    )
+
+    _LOGGER.debug(
+        "graphdb_total_python_packages_with_solver_error=%r",
+        total_python_packages_with_solver_error_unparsable + total_python_packages_with_solver_error_unsolvable,
+    )
+
+    _LOGGER.debug(
+        "graphdb_total_python_packages_with_solver_error_unparsable=%r",
+        total_python_packages_with_solver_error_unparsable,
+    )
+
+    _LOGGER.debug(
+        "graphdb_total_python_packages_with_solver_error_unsolvable=%r",
+        total_python_packages_with_solver_error_unsolvable,
+    )
+
+
+def get_unique_python_packages_count():
+    """Get the total number of unique python packages in Thoth Knowledge Graph."""
+    graph_db = GraphDatabase()
+    graph_db.connect()
+
+    total_unique_python_packages = len(graph_db.get_python_packages())
+    metrics.graphdb_total_unique_python_packages.set(total_unique_python_packages)
+    _LOGGER.debug("graphdb_total_unique_python_packages=%r", len(graph_db.get_python_packages()))
+
+
+def get_unsolved_python_packages_count():
+    """Get number of unsolved Python packages per solver."""
+    graph_db = GraphDatabase()
+    graph_db.connect()
+
+    for solver_name in _OPENSHIFT.get_solver_names():
+        count = graph_db.retrieve_unsolved_python_packages_count(solver_name)
+        metrics.graphdb_total_number_unsolved_python_packages.labels(solver_name).set(count)
+        _LOGGER.debug("graphdb_total_number_unsolved_python_packages(%r)=%r", solver_name, count)
+
+
+def get_unique_run_software_environment_count():
+    """Get the total number of unique software environment for run in Thoth Knowledge Graph."""
+    graph_db = GraphDatabase()
+    graph_db.connect()
+
+    thoth_graphdb_total_run_software_environment = len(set(graph_db.run_software_environment_listing()))
+    metrics.graphdb_total_run_software_environment.set(thoth_graphdb_total_run_software_environment)
+    _LOGGER.debug("graphdb_total_unique_run_software_environment=%r", thoth_graphdb_total_run_software_environment)
+
+
+def get_user_unique_run_software_environment_count():
+    """Get the total number of users unique software environment for run in Thoth Knowledge Graph."""
+    graph_db = GraphDatabase()
+    graph_db.connect()
+
+    thoth_graphdb_total_user_run_software_environment = len(
+        set(graph_db.run_software_environment_listing(is_user_run=True))
+    )
+
+    metrics.graphdb_total_user_run_software_environment.set(thoth_graphdb_total_user_run_software_environment)
+    _LOGGER.debug(
+        "graphdb_total_unique_user_run_software_environment=%r", thoth_graphdb_total_user_run_software_environment
+    )
+
+
+def get_unique_build_software_environment_count():
+    """Get the total number of unique software environment for build in Thoth Knowledge Graph."""
+    graph_db = GraphDatabase()
+    graph_db.connect()
+
+    thoth_graphdb_total_build_software_environment = len(set(graph_db.build_software_environment_listing()))
+
+    metrics.graphdb_total_build_software_environment.set(thoth_graphdb_total_build_software_environment)
+    _LOGGER.debug(
+        "graphdb_total_unique_build_software_environment=%r", thoth_graphdb_total_build_software_environment
+    )
+
+
+def get_observations_count_per_framework():
+    """Get the total number of PI per framework in Thoth Knowledge Graph."""
+    graph_db = GraphDatabase()
+    graph_db.connect()
+    thoth_number_of_pi_per_type = {}
+
+    frameworks = ["tensorflow"]
+
+    for framework in frameworks:
+        thoth_number_of_pi_per_type[framework] = graph_db.get_all_pi_per_framework_count(framework=framework)
+
+        for pi, pi_count in thoth_number_of_pi_per_type[framework].items():
+            metrics.graphdb_total_number_of_pi_per_framework.labels(framework, pi).set(pi_count)
+
+    _LOGGER.debug("graphdb_total_number_of_pi_per_framework=%r", thoth_number_of_pi_per_type)
+
+
+def get_graphdb_connection_error_status():
+    """Raise a flag if there is an error connecting to database."""
+    graph_db = GraphDatabase()
     try:
-        # janusgraph is a hostname injected into the pod by the 'janusgraph' service object
-        graph = GraphDatabase()
-        graph.connect()
-
-        package_version_total.labels(ecosystem="pypi", solver="f27", status="unsolved").set(
-            len(list(chain(*graph.retrieve_unsolved_pypi_packages().values())))
-        )
-    except aiohttp.client_exceptions.ClientConnectorError as excptn:
-        _LOGGER.error(excptn)
-
-
-def countJobStatus(JobListItems: dict) -> (int, int, int):
-    """Count the number of created, failed and succeeded Solver Jobs."""
-    created = 0
-    failed = 0
-    succeeded = 0
-
-    for item in JobListItems:
-        created = created + 1
-
-        try:
-            if "succeeded" in item["status"].keys():
-                succeeded = succeeded + 1
-            if "failed" in item["status"].keys():
-                failed = failed + 1
-        except KeyError as excptn:
-            pass
-
-    return (created, failed, succeeded)
-
-
-@solver_jobs_seconds.time()
-def get_thoth_solver_jobs(namespace: str = None):
-    """Get the total number Solver Jobs."""
-    if namespace is None:
-        namespace = os.getenv("MY_NAMESPACE")
-
-    endpoint = "{}/namespaces/{}/jobs".format(
-        "https://paas.upshift.redhat.com:443/apis/batch/v1", namespace
-    )  # FIXME the OpenShift API URL should not be hardcoded
-
-    try:
-        # FIXME we should not hardcode the solver dist names
-        response = requests.get(
-            endpoint,
-            headers={
-                "Authorization": "Bearer {}".format(get_service_account_token()),
-                "Content-Type": "application/json",
-            },
-            params={"labelSelector": "component=solver-f27"},
-            verify=False,
-        ).json()
-
-        created, failed, succeeded = countJobStatus(response["items"])
-
-        solver_jobs_total.labels("f27", "created").set(created)
-        solver_jobs_total.labels("f27", "failed").set(failed)
-        solver_jobs_total.labels("f27", "succeeded").set(succeeded)
-
-    except ResourceNotFoundError as excptn:
-        _LOGGER.error(excptn)
-
-
-@solver_documents_seconds.time()
-def get_solver_documents(solver_name: str = None):
-    """Get the total number Solver Documents in Graph Database."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        graph_db = GraphDatabase.create()
         graph_db.connect()
-    except aiohttp.client_exceptions.ClientConnectorError as excptn:
-        _LOGGER.error(excptn)
-        return
-
-    solver_documents = graph_db.get_solver_documents_count()
-
-    _LOGGER.debug("solver_documents=%r", solver_documents)
+    except Exception as excptn:
+        metrics.graphdb_connection_error_status.set(1)
+        _LOGGER.exception(excptn)
+    else:
+        metrics.graphdb_connection_error_status.set(0)
 
 
-@analyzer_documents_seconds.time()
-def get_analyzer_documents():
-    """Get the total number Analyzer Documents in Graph Database."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+def get_ceph_connection_error_status():
+    """Check connection to Ceph instance."""
+    inspections = InspectionResultsStore()
+    try:
+        inspections.connect()
+    except Exception as excptn:
+        metrics.ceph_connection_error_status.set(1)
+        _LOGGER.exception(excptn)
+    else:
+        metrics.ceph_connection_error_status.set(0)
 
-    graph_db = GraphDatabase.create()
-    graph_db.connect()
-    analyzer_documents = graph_db.get_solver_documents_count()
 
-    _LOGGER.debug("analyzer_documents_total=%r", analyzer_documents)
-
-
-def get_janusgraph_v_and_e_total():
-    """Get the total number of Vertices and Edges stored in JanusGraph Server."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    graph_db = GraphDatabase.create()
-    graph_db.connect()
-
-    v_total = asyncio.get_event_loop().run_until_complete(graph_db.g.V().count().next())
-    e_total = asyncio.get_event_loop().run_until_complete(graph_db.g.E().count().next())
-
-    graphdatabase_vertex_total.set(v_total)
-    graphdatabase_edge_total.set(e_total)
+ALL_REGISTERED_JOBS = frozenset(
+    (
+        get_thoth_jobs_per_label,
+        get_configmaps_per_namespace_per_label,
+        get_ceph_results_per_type,
+        get_inspection_results_per_identifier,
+        get_python_packages_solver_error_count,
+        get_unique_python_packages_count,
+        get_unique_run_software_environment_count,
+        get_unsolved_python_packages_count,
+        get_user_unique_run_software_environment_count,
+        get_unique_build_software_environment_count,
+        get_observations_count_per_framework,
+        get_graphdb_connection_error_status,
+        get_ceph_connection_error_status,
+    )
+)

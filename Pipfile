@@ -4,13 +4,12 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-prometheus_client = "*"
+prometheus-client = "*"
 thoth-storages = "*"
-thoth-common = {extras = ["openshift"], version = "*"}
-requests = "*"
+thoth-common = "*"
 responder = "==1.1.1"
-uvicorn = "*"
-starlette = "<0.8.0"
+flask-apscheduler = "*"
+gunicorn = "*"
 
 [dev-packages]
 
